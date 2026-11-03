@@ -434,6 +434,66 @@ impl AllocationSizes {
         let shift = count.min(7) as u64;
         (min_size << shift).min(max_size)
     }
+
+    /// The largest allocation a small block holds: a sixteenth of the
+    /// smallest block of its kind of memory.
+    pub(crate) fn small_allocation_limit(&self, is_host: bool) -> u64 {
+        let min_size = if is_host {
+            self.min_host_memblock_size
+        } else {
+            self.min_device_memblock_size
+        };
+        min_size / SMALL_ALLOCATIONS_PER_BLOCK
+    }
+
+    /// Which blocks an allocation of `size` bytes is placed in.
+    pub(crate) fn block_class(&self, is_host: bool, size: u64) -> BlockClass {
+        if size <= self.small_allocation_limit(is_host) {
+            BlockClass::Small
+        } else {
+            BlockClass::General
+        }
+    }
+
+    /// The size of a block that holds small allocations: the smallest block
+    /// of its kind of memory, whatever the number of blocks.
+    pub(crate) fn small_memblock_size(&self, is_host: bool) -> u64 {
+        if is_host {
+            self.min_host_memblock_size
+        } else {
+            self.min_device_memblock_size
+        }
+    }
+
+    /// The size of a new shared block of `class`, given how many blocks of
+    /// that class the memory type holds.
+    pub(crate) fn memblock_size_for(&self, class: BlockClass, is_host: bool, count: usize) -> u64 {
+        match class {
+            BlockClass::Small => self.small_memblock_size(is_host),
+            BlockClass::General => self.get_memblock_size(is_host, count),
+        }
+    }
+}
+
+/// How many allocations at the size limit of a small block fit in one: an
+/// allocation is small when it is at most the smallest block size divided by
+/// this.
+const SMALL_ALLOCATIONS_PER_BLOCK: u64 = 16;
+
+/// The blocks an allocation shares.
+///
+/// A small allocation is placed only in blocks that hold small allocations,
+/// and every other allocation only in general blocks. A block is returned to
+/// the device once nothing is allocated in it, so a small allocation that
+/// lives long keeps a block alive: in a block of its own class it holds a
+/// block of the smallest size, among other small allocations, and the general
+/// blocks that large allocations came and went in empty out and are returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockClass {
+    /// Allocations of at most [`AllocationSizes::small_allocation_limit`].
+    Small,
+    /// Every larger allocation.
+    General,
 }
 
 impl Default for AllocationSizes {
@@ -445,5 +505,54 @@ impl Default for AllocationSizes {
             min_host_memblock_size: 64 * MB,
             max_host_memblock_size: 64 * MB,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AllocationSizes, BlockClass};
+
+    const MB: u64 = 1024 * 1024;
+
+    /// An allocation of at most a sixteenth of the smallest block is small,
+    /// and its block is the smallest block however many there are; every
+    /// larger allocation takes the growing general blocks.
+    #[test]
+    fn small_allocations_take_small_blocks_of_their_own() {
+        let sizes = AllocationSizes::new(8 * MB, 4 * MB)
+            .with_max_device_memblock_size(64 * MB)
+            .with_max_host_memblock_size(32 * MB);
+
+        assert_eq!(sizes.block_class(false, 192), BlockClass::Small);
+        assert_eq!(sizes.block_class(false, 512 * 1024), BlockClass::Small);
+        assert_eq!(
+            sizes.block_class(false, 512 * 1024 + 1),
+            BlockClass::General
+        );
+        assert_eq!(sizes.block_class(true, 256 * 1024), BlockClass::Small);
+        assert_eq!(sizes.block_class(true, 256 * 1024 + 1), BlockClass::General);
+
+        for count in [0, 1, 5, 40] {
+            assert_eq!(
+                sizes.memblock_size_for(BlockClass::Small, false, count),
+                8 * MB
+            );
+            assert_eq!(
+                sizes.memblock_size_for(BlockClass::Small, true, count),
+                4 * MB
+            );
+        }
+        assert_eq!(
+            sizes.memblock_size_for(BlockClass::General, false, 0),
+            8 * MB
+        );
+        assert_eq!(
+            sizes.memblock_size_for(BlockClass::General, false, 2),
+            32 * MB
+        );
+        assert_eq!(
+            sizes.memblock_size_for(BlockClass::General, false, 5),
+            64 * MB
+        );
     }
 }
