@@ -28,7 +28,8 @@ use crate::{
         AllocationType, AllocatorReport, DedicatedBlockAllocator, FreeListAllocator,
         MemoryBlockReport, SubAllocator,
     },
-    AllocationError, AllocationSizes, AllocatorDebugSettings, BlockClass, MemoryLocation, Result,
+    ActiveBlocks, AllocationError, AllocationSizes, AllocatorDebugSettings, BlockClass,
+    MemoryLocation, Result,
 };
 
 /// [`ResourceCategory`] is used for supporting [`D3D12_RESOURCE_HEAP_TIER_1`].
@@ -265,6 +266,9 @@ struct MemoryBlock {
     sub_allocator: Box<dyn SubAllocator>,
     /// The allocations a shared block takes.
     class: BlockClass,
+    /// Whether the block stays reserved as the last of its class once it
+    /// empties ([`AllocationSizes::keeps_last_empty_block`]).
+    kept_as_last: bool,
 }
 impl MemoryBlock {
     fn new(
@@ -314,6 +318,7 @@ impl MemoryBlock {
             size,
             sub_allocator,
             class: BlockClass::General,
+            kept_as_last: true,
         })
     }
 }
@@ -326,9 +331,8 @@ struct MemoryType {
     heap_category: HeapCategory,
     heap_properties: D3D12_HEAP_PROPERTIES,
     memory_type_index: usize,
-    active_general_blocks: usize,
-    /// How many shared blocks hold small allocations.
-    active_small_blocks: usize,
+    /// How many shared blocks of each class this memory type holds.
+    active_blocks: ActiveBlocks,
 }
 
 impl MemoryType {
@@ -346,14 +350,8 @@ impl MemoryType {
         let alignment = desc.alignment;
 
         let class = allocation_sizes.block_class(is_host, size);
-        let memblock_size = allocation_sizes.memblock_size_for(
-            class,
-            is_host,
-            match class {
-                BlockClass::Small => self.active_small_blocks,
-                BlockClass::General => self.active_general_blocks,
-            },
-        );
+        let memblock_size =
+            allocation_sizes.memblock_size_for(class, is_host, self.active_blocks.of(class));
 
         // Create a dedicated block for large memory allocations
         if size > memblock_size {
@@ -438,14 +436,27 @@ impl MemoryType {
             }
         }
 
+        // The bytes allocated in this class's blocks size the block it opens.
+        let live: u64 = self
+            .memory_blocks
+            .iter()
+            .flatten()
+            .filter(|mem_block| mem_block.class == class)
+            .map(|mem_block| mem_block.sub_allocator.allocated())
+            .sum();
+        let new_block_size =
+            allocation_sizes.next_memblock_size(class, is_host, self.active_blocks.of(class), live);
+
         let mut new_memory_block = MemoryBlock::new(
             device,
-            memblock_size,
+            new_block_size,
             &self.heap_properties,
             self.heap_category,
             false,
         )?;
         new_memory_block.class = class;
+        new_memory_block.kept_as_last =
+            allocation_sizes.keeps_last_empty_block(class, is_host, new_block_size);
 
         let new_block_index = if let Some(block_index) = empty_block_index {
             self.memory_blocks[block_index] = Some(new_memory_block);
@@ -455,10 +466,7 @@ impl MemoryType {
             self.memory_blocks.len() - 1
         };
 
-        match class {
-            BlockClass::Small => self.active_small_blocks += 1,
-            BlockClass::General => self.active_general_blocks += 1,
-        }
+        self.active_blocks.opened(class);
 
         let mem_block = self.memory_blocks[new_block_index]
             .as_mut()
@@ -502,23 +510,20 @@ impl MemoryType {
 
         // We only want to destroy this now-empty block if it is either a dedicated/personal
         // allocation, or a block supporting sub-allocations that is not the last one of its
-        // class (ensuring there's always at least one block/allocator readily available).
+        // class (ensuring there's always at least one block/allocator readily available), or
+        // a small tier's last block grown past the tier's own size.
         let shared = mem_block.sub_allocator.supports_general_allocations();
-        let active_of_class = match mem_block.class {
-            BlockClass::Small => self.active_small_blocks,
-            BlockClass::General => self.active_general_blocks,
-        };
+        let active_of_class = self.active_blocks.of(mem_block.class);
         let is_dedicated_or_not_last_block_of_class = !shared || active_of_class > 1;
-        if mem_block.sub_allocator.is_empty() && is_dedicated_or_not_last_block_of_class {
+        if mem_block.sub_allocator.is_empty()
+            && (is_dedicated_or_not_last_block_of_class || !mem_block.kept_as_last)
+        {
             let block = self.memory_blocks[block_idx]
                 .take()
                 .ok_or_else(|| AllocationError::Internal("Memory block must be Some.".into()))?;
 
             if shared {
-                match block.class {
-                    BlockClass::Small => self.active_small_blocks -= 1,
-                    BlockClass::General => self.active_general_blocks -= 1,
-                }
+                self.active_blocks.closed(block.class);
             }
 
             // Note that `block` will be destroyed on `drop` here
@@ -626,8 +631,7 @@ impl Allocator {
                     heap_category,
                     heap_properties,
                     memory_type_index: i,
-                    active_general_blocks: 0,
-                    active_small_blocks: 0,
+                    active_blocks: ActiveBlocks::default(),
                     committed_allocations: CommittedAllocationStatistics {
                         num_allocations: 0,
                         total_size: 0,
