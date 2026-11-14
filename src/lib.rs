@@ -438,62 +438,168 @@ impl AllocationSizes {
     /// The largest allocation a small block holds: a sixteenth of the
     /// smallest block of its kind of memory.
     pub(crate) fn small_allocation_limit(&self, is_host: bool) -> u64 {
-        let min_size = if is_host {
+        self.small_tier_block_size(is_host, 0) / SMALL_ALLOCATIONS_PER_BLOCK
+    }
+
+    /// Which blocks an allocation of `size` bytes is placed in.
+    ///
+    /// A small allocation goes to the smallest tier whose blocks hold at
+    /// least [`SMALL_ALLOCATIONS_PER_BLOCK`] allocations of its size.
+    pub(crate) fn block_class(&self, is_host: bool, size: u64) -> BlockClass {
+        if size > self.small_allocation_limit(is_host) {
+            return BlockClass::General;
+        }
+        let mut tier = 0;
+        while tier + 1 < SMALL_BLOCK_TIERS
+            && size * SMALL_ALLOCATIONS_PER_BLOCK <= self.small_tier_block_size(is_host, tier + 1)
+        {
+            tier += 1;
+        }
+        BlockClass::Small(tier)
+    }
+
+    /// The size of a block of small tier `tier`: the smallest block of its
+    /// kind of memory divided by the tier's [`SMALL_TIER_DIVISORS`] entry.
+    pub(crate) fn small_tier_block_size(&self, is_host: bool, tier: u8) -> u64 {
+        let smallest = if is_host {
             self.min_host_memblock_size
         } else {
             self.min_device_memblock_size
         };
-        min_size / SMALL_ALLOCATIONS_PER_BLOCK
+        smallest / SMALL_TIER_DIVISORS[usize::from(tier)]
     }
 
-    /// Which blocks an allocation of `size` bytes is placed in.
-    pub(crate) fn block_class(&self, is_host: bool, size: u64) -> BlockClass {
-        if size <= self.small_allocation_limit(is_host) {
-            BlockClass::Small
-        } else {
-            BlockClass::General
-        }
-    }
-
-    /// The size of a block that holds small allocations: the smallest block
-    /// of its kind of memory, whatever the number of blocks.
-    pub(crate) fn small_memblock_size(&self, is_host: bool) -> u64 {
-        if is_host {
-            self.min_host_memblock_size
-        } else {
-            self.min_device_memblock_size
-        }
-    }
-
-    /// The size of a new shared block of `class`, given how many blocks of
-    /// that class the memory type holds.
+    /// The size a shared block of `class` starts from, given how many blocks
+    /// of that class the memory type holds: a small tier's own block size, or
+    /// the general block size for `count` blocks. An allocation larger than
+    /// this takes a block of its own.
     pub(crate) fn memblock_size_for(&self, class: BlockClass, is_host: bool, count: usize) -> u64 {
         match class {
-            BlockClass::Small => self.small_memblock_size(is_host),
+            BlockClass::Small(tier) => self.small_tier_block_size(is_host, tier),
             BlockClass::General => self.get_memblock_size(is_host, count),
+        }
+    }
+
+    /// The size of the next shared block of `class` taken from the device,
+    /// given how many blocks of that class the memory type holds and the bytes
+    /// allocated in them (`live`).
+    ///
+    /// A small tier's next block is the largest power-of-two multiple of the
+    /// tier's own block size that is at most `live`, and at most the smallest
+    /// block size: a tier holding little opens blocks of its own size, and a
+    /// tier filling up opens blocks as large as what it already holds, so a
+    /// burst of small allocations opens a number of blocks that grows with
+    /// the logarithm of its bytes up to the smallest block size, and in
+    /// proportion to them past it. A tier's blocks therefore reserve at most
+    /// about twice what is allocated in them when the last one opened, and
+    /// the tier's own block size more. General blocks take
+    /// [`AllocationSizes::memblock_size_for`].
+    pub(crate) fn next_memblock_size(
+        &self,
+        class: BlockClass,
+        is_host: bool,
+        count: usize,
+        live: u64,
+    ) -> u64 {
+        match class {
+            BlockClass::Small(tier) => {
+                let cap = self.small_tier_block_size(is_host, 0);
+                let mut size = self.small_tier_block_size(is_host, tier);
+                while size * 2 <= cap && size * 2 <= live {
+                    size *= 2;
+                }
+                size
+            }
+            BlockClass::General => self.get_memblock_size(is_host, count),
+        }
+    }
+
+    /// Whether an emptied shared block of `class` stays reserved as the class's
+    /// last block: a general block always does, and a small tier's only at
+    /// the tier's own block size, so a larger block a burst opened is returned
+    /// to the device once it empties.
+    pub(crate) fn keeps_last_empty_block(
+        &self,
+        class: BlockClass,
+        is_host: bool,
+        size: u64,
+    ) -> bool {
+        match class {
+            BlockClass::Small(tier) => size == self.small_tier_block_size(is_host, tier),
+            BlockClass::General => true,
         }
     }
 }
 
 /// How many allocations at the size limit of a small block fit in one: an
 /// allocation is small when it is at most the smallest block size divided by
-/// this.
+/// this, and it is placed in the smallest tier whose blocks hold this many of
+/// its size.
 const SMALL_ALLOCATIONS_PER_BLOCK: u64 = 16;
+
+/// The sizes of small block, as divisors of the smallest block size: the
+/// smallest block itself, and an eighth of it (8 and 1 MB for an 8 MB smallest
+/// block). An allocation of up to a sixteenth of the eighth (64 KB there)
+/// shares the eighth tier's blocks, which are the eighth size while the tier
+/// holds little, so a long-lived allocation of a few bytes to a few kilobytes
+/// made among few others of its size keeps a block of that size reserved
+/// ([`AllocationSizes::next_memblock_size`]). Each tier a memory type uses
+/// costs it at least one partly filled block, which is why the tiers are these
+/// two rather than every halving between them.
+const SMALL_TIER_DIVISORS: [u64; 2] = [1, 8];
+
+/// How many sizes of small block there are.
+pub(crate) const SMALL_BLOCK_TIERS: u8 = SMALL_TIER_DIVISORS.len() as u8;
 
 /// The blocks an allocation shares.
 ///
-/// A small allocation is placed only in blocks that hold small allocations,
-/// and every other allocation only in general blocks. A block is returned to
-/// the device once nothing is allocated in it, so a small allocation that
-/// lives long keeps a block alive: in a block of its own class it holds a
-/// block of the smallest size, among other small allocations, and the general
-/// blocks that large allocations came and went in empty out and are returned.
+/// A small allocation is placed only in blocks of its own small tier, and
+/// every other allocation only in general blocks. A block is returned to the
+/// device once nothing is allocated in it, so an allocation that lives long
+/// keeps its block alive: a small one holds a block of its tier, among
+/// allocations of its own tier's sizes, and the blocks that larger
+/// allocations came and went in empty out and are returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockClass {
-    /// Allocations of at most [`AllocationSizes::small_allocation_limit`].
-    Small,
+    /// Allocations of at most [`AllocationSizes::small_allocation_limit`],
+    /// by tier: tier `t` blocks are the smallest block size divided by
+    /// [`SMALL_TIER_DIVISORS`]`[t]`.
+    Small(u8),
     /// Every larger allocation.
     General,
+}
+
+/// How many shared blocks of each class a memory type holds.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ActiveBlocks {
+    general: usize,
+    small: [usize; SMALL_BLOCK_TIERS as usize],
+}
+
+impl ActiveBlocks {
+    /// The number of shared blocks of `class`.
+    pub(crate) fn of(&self, class: BlockClass) -> usize {
+        match class {
+            BlockClass::Small(tier) => self.small[usize::from(tier)],
+            BlockClass::General => self.general,
+        }
+    }
+
+    /// Counts a shared block of `class` taken from the device.
+    pub(crate) fn opened(&mut self, class: BlockClass) {
+        match class {
+            BlockClass::Small(tier) => self.small[usize::from(tier)] += 1,
+            BlockClass::General => self.general += 1,
+        }
+    }
+
+    /// Counts a shared block of `class` returned to the device.
+    pub(crate) fn closed(&mut self, class: BlockClass) {
+        match class {
+            BlockClass::Small(tier) => self.small[usize::from(tier)] -= 1,
+            BlockClass::General => self.general -= 1,
+        }
+    }
 }
 
 impl Default for AllocationSizes {
@@ -515,30 +621,30 @@ mod tests {
     const MB: u64 = 1024 * 1024;
 
     /// An allocation of at most a sixteenth of the smallest block is small,
-    /// and its block is the smallest block however many there are; every
-    /// larger allocation takes the growing general blocks.
+    /// and its block is the smallest tier holding sixteen of its size, the
+    /// same size however many there are; every larger allocation takes the
+    /// growing general blocks.
     #[test]
     fn small_allocations_take_small_blocks_of_their_own() {
         let sizes = AllocationSizes::new(8 * MB, 4 * MB)
             .with_max_device_memblock_size(64 * MB)
             .with_max_host_memblock_size(32 * MB);
 
-        assert_eq!(sizes.block_class(false, 192), BlockClass::Small);
-        assert_eq!(sizes.block_class(false, 512 * 1024), BlockClass::Small);
+        assert_eq!(sizes.block_class(false, 512 * 1024), BlockClass::Small(0));
         assert_eq!(
             sizes.block_class(false, 512 * 1024 + 1),
             BlockClass::General
         );
-        assert_eq!(sizes.block_class(true, 256 * 1024), BlockClass::Small);
+        assert_eq!(sizes.block_class(true, 256 * 1024), BlockClass::Small(0));
         assert_eq!(sizes.block_class(true, 256 * 1024 + 1), BlockClass::General);
 
         for count in [0, 1, 5, 40] {
             assert_eq!(
-                sizes.memblock_size_for(BlockClass::Small, false, count),
+                sizes.memblock_size_for(BlockClass::Small(0), false, count),
                 8 * MB
             );
             assert_eq!(
-                sizes.memblock_size_for(BlockClass::Small, true, count),
+                sizes.memblock_size_for(BlockClass::Small(0), true, count),
                 4 * MB
             );
         }
@@ -554,5 +660,108 @@ mod tests {
             sizes.memblock_size_for(BlockClass::General, false, 5),
             64 * MB
         );
+    }
+
+    /// A small allocation of up to a sixteenth of an eighth of the smallest
+    /// block shares the eighth-size blocks, and a larger small allocation the
+    /// smallest blocks. A long-lived allocation of a few bytes therefore keeps
+    /// at most a 1 MB block reserved where the smallest block is 8 MB.
+    #[test]
+    fn a_small_allocation_takes_the_tier_sized_to_it() {
+        let sizes = AllocationSizes::new(8 * MB, 4 * MB);
+
+        assert_eq!(sizes.block_class(false, 192), BlockClass::Small(1));
+        assert_eq!(sizes.block_class(false, 64 * 1024), BlockClass::Small(1));
+        assert_eq!(
+            sizes.block_class(false, 64 * 1024 + 1),
+            BlockClass::Small(0)
+        );
+        assert_eq!(sizes.block_class(false, 512 * 1024), BlockClass::Small(0));
+        assert_eq!(sizes.block_class(true, 32 * 1024), BlockClass::Small(1));
+        assert_eq!(sizes.block_class(true, 32 * 1024 + 1), BlockClass::Small(0));
+
+        assert_eq!(sizes.memblock_size_for(BlockClass::Small(1), false, 0), MB);
+        assert_eq!(
+            sizes.memblock_size_for(BlockClass::Small(1), true, 0),
+            MB / 2
+        );
+        assert_eq!(
+            sizes.memblock_size_for(BlockClass::Small(0), false, 3),
+            8 * MB
+        );
+
+        for size in [1, 192, 4096, 64 * 1024, 100_000, 300_000, 512 * 1024] {
+            let class = sizes.block_class(false, size);
+            let block = sizes.memblock_size_for(class, false, 0);
+            assert!(
+                block >= size * 16,
+                "{size} B sits sixteen to a {block} B block"
+            );
+        }
+    }
+
+    /// A small tier's next block is the largest power-of-two multiple of its
+    /// own size that the bytes already allocated in the tier reach, up to the
+    /// smallest block size; the smallest tier's blocks stay that size.
+    #[test]
+    fn a_small_tier_filling_up_opens_blocks_as_large_as_it_holds() {
+        let sizes = AllocationSizes::new(8 * MB, 4 * MB);
+        let next = |tier, live| sizes.next_memblock_size(BlockClass::Small(tier), false, 0, live);
+
+        assert_eq!(next(1, 0), MB);
+        assert_eq!(next(1, MB - 1), MB);
+        assert_eq!(next(1, 2 * MB - 1), MB);
+        assert_eq!(next(1, 2 * MB), 2 * MB);
+        assert_eq!(next(1, 5 * MB), 4 * MB);
+        assert_eq!(next(1, 8 * MB), 8 * MB);
+        assert_eq!(next(1, 300 * MB), 8 * MB);
+        assert_eq!(next(0, 0), 8 * MB);
+        assert_eq!(next(0, 300 * MB), 8 * MB);
+        assert_eq!(
+            sizes.next_memblock_size(BlockClass::Small(1), true, 0, 64 * MB),
+            4 * MB
+        );
+        assert_eq!(
+            sizes.next_memblock_size(BlockClass::General, false, 0, 64 * MB),
+            8 * MB
+        );
+
+        // A burst of 15 MB of allocations of up to 64 KB into an empty tier
+        // opens 1, 1, 2, 4 and 8 MB blocks: five, against fifteen of 1 MB.
+        let mut live = 0;
+        let mut blocks = Vec::new();
+        while live < 15 * MB {
+            let block = next(1, live);
+            blocks.push(block / MB);
+            live += block;
+        }
+        assert_eq!(blocks, [1, 1, 2, 4, 8]);
+    }
+
+    /// An emptied block stays reserved as its class's last only at the
+    /// size its class starts from.
+    #[test]
+    fn only_a_block_of_its_tier_size_stays_as_the_last() {
+        let sizes = AllocationSizes::new(8 * MB, 4 * MB);
+        assert!(sizes.keeps_last_empty_block(BlockClass::Small(1), false, MB));
+        assert!(!sizes.keeps_last_empty_block(BlockClass::Small(1), false, 2 * MB));
+        assert!(sizes.keeps_last_empty_block(BlockClass::Small(1), true, MB / 2));
+        assert!(!sizes.keeps_last_empty_block(BlockClass::Small(1), true, MB));
+        assert!(sizes.keeps_last_empty_block(BlockClass::Small(0), false, 8 * MB));
+        assert!(sizes.keeps_last_empty_block(BlockClass::General, false, 64 * MB));
+    }
+
+    /// Each class counts its own shared blocks, small tiers apart.
+    #[test]
+    fn each_class_counts_its_own_blocks() {
+        let mut active = super::ActiveBlocks::default();
+        active.opened(BlockClass::Small(1));
+        active.opened(BlockClass::Small(1));
+        active.opened(BlockClass::General);
+        assert_eq!(active.of(BlockClass::Small(1)), 2);
+        assert_eq!(active.of(BlockClass::Small(0)), 0);
+        assert_eq!(active.of(BlockClass::General), 1);
+        active.closed(BlockClass::Small(1));
+        assert_eq!(active.of(BlockClass::Small(1)), 1);
     }
 }
